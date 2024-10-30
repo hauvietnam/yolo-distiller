@@ -186,10 +186,11 @@ class FeatureLoss(nn.Module):
         stu_feats = []
 
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            # change ---
-            s = self.align_module[idx](s)
-            s = self.norm[idx](s)
-            t = self.norm[idx](t)
+            if self.distiller == "cwd":
+                s = self.align_module[idx](s)
+                s = self.norm[idx](s)
+            else:
+                t = self.norm1[idx](t)
             tea_feats.append(t)
             stu_feats.append(s)
 
@@ -203,9 +204,34 @@ class DistillationLoss:
 
         layers = ["6", "8", "13", "16", "19", "22"]
 
-        channels_s = [256, 512, 256, 128, 256, 512]
-        channels_t = [512, 512, 512, 256, 512, 512]
+        channels_s = []
+        channels_t = []
+        
+        # Find channel size
+        for name, ml in modelt.named_modules():
+            if name is not None:
+                name = name.split(".")
+                if name[0] == "model":
+                    name.pop(0)
+                if len(name) == 3:
+                    if name[1] in layers:
+                        if "cv2" in name[2]:
+                            channels_t.append(ml.conv.out_channels)
+        
+        for name, ml in models.named_modules():
+            if name is not None:
+                name = name.split(".")
+                if name[0] == "model":
+                    name.pop(0)
+                if len(name) == 3:
+                    if name[1] in layers:
+                        if "cv2" in name[2]:
+                            channels_s.append(ml.conv.out_channels)
 
+        nl = len(layers)
+        channels_s = channels_s[-nl:]
+        channels_t = channels_t[-nl:]
+        
         self.D_loss_fn = FeatureLoss(channels_s=channels_s, channels_t=channels_t, distiller=distiller[:3])
 
         self.teacher_module_pairs = []
@@ -228,8 +254,8 @@ class DistillationLoss:
                 name = mname.split(".")
                 if name[0] == "model":
                     name.pop(0)
-                if len(name) == 2:
-                    if name[0] in layers:
+                if len(name) == 3:
+                    if name[1] in layers:
                         if "cv2" in mname:
                             self.student_module_pairs.append(ml)
 
@@ -316,10 +342,16 @@ class BaseTrainer:
         self.metrics = None
         self.plots = {}
         
-        self.teacher = overrides["teacher"]
-        self.distillation_loss = overrides["distillation_loss"]
-        overrides.pop("teacher")
-        overrides.pop("distillation_loss")
+        if overrides:
+            self.teacher = overrides.get("teacher", None)
+            self.loss_type = overrides.get("distillation_loss", None)
+            if "teacher" in overrides:
+                overrides.pop("teacher")
+            if "distillation_loss" in overrides:
+                overrides.pop("distillation_loss")
+        else:
+            self.loss_type = None
+            self.teacher = None
         
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
@@ -447,15 +479,17 @@ class BaseTrainer:
     def _setup_train(self, world_size):
         """Builds dataloaders and optimizer on correct rank process."""
         
-        if self.teacher is not None:
-            for k, v in self.teacher.model.named_parameters():
-                v.requires_grad = True
-                self.teacher = self.teacher.to(self.device)
-        
         # Model
         self.run_callbacks("on_pretrain_routine_start")
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
+        
+        # Load teacher model to device
+        if self.teacher is not None:
+            for k, v in self.teacher.model.named_parameters():
+                v.requires_grad = True
+            self.teacher = self.teacher.model.to(self.device)
+                
         self.set_model_attributes()
 
         # Freeze layers
@@ -497,7 +531,7 @@ class BaseTrainer:
             
             if self.teacher is not None:
                 self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
-                self.teacher.eval()
+                temp = self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -575,6 +609,11 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+            
+        # make loss
+        if self.teacher is not None:
+            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+        
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
@@ -597,7 +636,6 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
-            self.optimizer.zero_grad()
             
             if self.teacher is not None:
                 distillation_loss.register_hook()
@@ -631,7 +669,7 @@ class BaseTrainer:
                 if self.teacher is not None:
                     distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
                     with torch.no_grad():
-                        pred = self.Distillation(batch['img'])
+                        pred = self.teacher(batch['img'])
                         
                     self.d_loss = distillation_loss.get_loss()
                     self.d_loss *- distill_weight
@@ -1009,7 +1047,7 @@ class BaseTrainer:
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
-    def build_optimizer(self, model, teacher=None,name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+    def build_optimizer(self, model, teacher=None, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """
         Constructs an optimizer for the given model, based on the specified optimizer name, learning rate, momentum,
         weight decay, and number of iterations.
