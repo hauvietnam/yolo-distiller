@@ -587,11 +587,6 @@ class BaseTrainer:
         if world_size > 1:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
-        
-        # Add distillation
-        if self.teacher is not None:
-            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.distillation_loss)
-        
 
         nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
