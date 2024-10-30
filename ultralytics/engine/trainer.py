@@ -276,12 +276,12 @@ class DistillationLoss:
 
     def get_loss(self):
         quant_loss = 0
-        if self.teacher_outputs[0] is None:
-            self.teacher_outputs_clss=self.teacher_outputs[len(self.teacher_outputs) // 2:]
-        else :
-            self.teacher_outputs_clss=self.teacher_outputs
+        # if self.teacher_outputs[0] is None:
+        #     self.teacher_outputs_clss=self.teacher_outputs[len(self.teacher_outputs) // 2:]
+        # else :
+        #     self.teacher_outputs_clss=self.teacher_outputs
 
-        quant_loss += self.D_loss_fn(y_t= self.teacher_outputs_clss, y_s=self.origin_outputs)
+        quant_loss += self.D_loss_fn(y_t= self.teacher_outputs, y_s=self.origin_outputs)
         if self.distiller != 'cwd':
             quant_loss *= 0.3
         self.teacher_outputs.clear()
