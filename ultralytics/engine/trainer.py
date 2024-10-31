@@ -668,9 +668,7 @@ class BaseTrainer:
                         
                     self.d_loss = distillation_loss.get_loss()
                     self.d_loss *- distill_weight
-                    if i == 0:
-                        print(self.d_loss, "-"*20)
-                        print(self.loss, "-"*20)
+                    
                     self.loss += self.d_loss
 
                 # Backward
