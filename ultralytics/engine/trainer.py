@@ -154,20 +154,29 @@ class FeatureLoss(nn.Module):
         super(FeatureLoss, self).__init__()
         self.loss_weight = loss_weight
         self.distiller = distiller
-
+        
+        # Move all modules to same precision
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.align_module = nn.ModuleList([
-            nn.Conv2d(channel, tea_channel, kernel_size=1, stride=1, padding=0).to(device)
-            for channel, tea_channel in zip(channels_s, channels_t)
-        ])
-        self.norm = [
-            nn.BatchNorm2d(tea_channel, affine=False).to(device)
-            for tea_channel in channels_t
-        ]
-        self.norm1 = [
-            nn.BatchNorm2d(set_channel, affine=False).to(device)
-            for set_channel in channels_s
-        ]
+        
+        # Convert to ModuleList and ensure consistent dtype
+        self.align_module = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        self.norm1 = nn.ModuleList()
+        
+        # Create alignment modules
+        for s_chan, t_chan in zip(channels_s, channels_t):
+            align = nn.Sequential(
+                nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(t_chan, affine=False)
+            ).to(device)
+            self.align_module.append(align)
+            
+        # Create normalization layers
+        for t_chan in channels_t:
+            self.norm.append(nn.BatchNorm2d(t_chan, affine=False).to(device))
+            
+        for s_chan in channels_s:
+            self.norm1.append(nn.BatchNorm2d(s_chan, affine=False).to(device))
 
         if distiller == 'mgd':
             self.feature_loss = MGDLoss(channels_s, channels_t)
@@ -184,19 +193,20 @@ class FeatureLoss(nn.Module):
         stu_feats = []
 
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            # Ensure tensors require gradients as needed
-            s = s.clone() if not s.requires_grad else s
-            t = t.clone() if not t.requires_grad else t
+            # Match input dtype to module dtype
+            s = s.type(next(self.align_module[idx].parameters()).dtype)
+            t = t.type(next(self.align_module[idx].parameters()).dtype)
             
             if self.distiller == "cwd":
-                aligned_s = self.align_module[idx](s)
-                normalized_s = self.norm[idx](aligned_s)
-                stu_feats.append(normalized_s)
+                # Apply alignment and normalization
+                s = self.align_module[idx](s)
+                stu_feats.append(s)
                 tea_feats.append(t.detach())
             else:
-                normalized_t = self.norm1[idx](t)
+                # Apply normalization
+                t = self.norm1[idx](t)
                 stu_feats.append(s)
-                tea_feats.append(normalized_t.detach())
+                tea_feats.append(t.detach())
 
         loss = self.feature_loss(stu_feats, tea_feats)
         return self.loss_weight * loss
@@ -209,11 +219,12 @@ class DistillationLoss:
         self.models = models 
         self.modelt = modelt
 
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         # ini warm up
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 640, 640)
-            _ = self.models(dummy_input)
-            _ = self.modelt(dummy_input)
+            _ = self.models(dummy_input.to(device))
+            _ = self.modelt(dummy_input.to(device))
         
         self.channels_s = []
         self.channels_t = []
@@ -239,21 +250,24 @@ class DistillationLoss:
         for name, ml in self.modelt.named_modules():
             if name is not None:
                 name = name.split(".")
-                if name[0] == "model":
-                    name.pop(0)
-                if len(name) == 3:
+                # print(name)
+                
+                if name[0] != "model":
+                    continue
+                if len(name) >= 3:
                     if name[1] in self.layers:
                         if "cv2" in name[2]:
                             if hasattr(ml, 'conv'):
                                 self.channels_t.append(ml.conv.out_channels)
                                 self.teacher_module_pairs.append(ml)
-        
+        # print()
         for name, ml in self.models.named_modules():
             if name is not None:
                 name = name.split(".")
-                if name[0] == "model":
-                    name.pop(0)
-                if len(name) == 3:
+                # print(name)
+                if name[0] != "model":
+                    continue
+                if len(name) >= 3:
                     if name[1] in self.layers:
                         if "cv2" in name[2]:
                             if hasattr(ml, 'conv'):
@@ -693,7 +707,6 @@ class BaseTrainer:
                         
                     self.d_loss = distillation_loss.get_loss()
                     self.d_loss *- distill_weight
-                    
                     self.loss += self.d_loss
 
                 # Backward
