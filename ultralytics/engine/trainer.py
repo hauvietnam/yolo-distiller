@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 
@@ -78,12 +79,10 @@ class CWDLoss(nn.Module):
 
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
             assert s.shape == t.shape
-
             N, C, H, W = s.shape
 
-            # normalize in channel diemension
-            import torch.nn.functional as F
-            softmax_pred_T = F.softmax(t.view(-1, W * H) / self.tau, dim=1)  # [N*C, H*W]
+            # normalize in channel dimension
+            softmax_pred_T = F.softmax(t.view(-1, W * H) / self.tau, dim=1)
 
             logsoftmax = torch.nn.LogSoftmax(dim=1)
             cost = torch.sum(
@@ -92,7 +91,6 @@ class CWDLoss(nn.Module):
 
             losses.append(cost / (C * N))
         loss = sum(losses)
-
         return loss
 
 class MGDLoss(nn.Module):
@@ -111,7 +109,9 @@ class MGDLoss(nn.Module):
             nn.Sequential(
                 nn.Conv2d(channel, channel, kernel_size=3, padding=1),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(channel, channel, kernel_size=3, padding=1)).to(device) for channel in teacher_channels])
+                nn.Conv2d(channel, channel, kernel_size=3, padding=1)
+            ).to(device) for channel in teacher_channels
+        ])
 
     def forward(self, y_s, y_t, layer=None):
         """Forward computation.
@@ -123,7 +123,6 @@ class MGDLoss(nn.Module):
         Return:
             torch.Tensor: The calculated loss value of all stages.
         """
-      #  assert len(y_s) == len(y_t)
         losses = []
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
             # print(s.shape)
@@ -147,7 +146,6 @@ class MGDLoss(nn.Module):
         new_fea = self.generation[idx](masked_fea)
 
         dis_loss = loss_mse(new_fea, preds_T) / N
-
         return dis_loss
 
 
@@ -179,20 +177,26 @@ class FeatureLoss(nn.Module):
             raise NotImplementedError
 
     def forward(self, y_s, y_t):
-        if len(y_s) !=len(y_t):
-            y_t =y_t[len(y_t) // 2:]
+        if len(y_s) != len(y_t):
+            y_t = y_t[len(y_t) // 2:]
 
         tea_feats = []
         stu_feats = []
 
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            # Ensure tensors require gradients as needed
+            s = s.clone() if not s.requires_grad else s
+            t = t.clone() if not t.requires_grad else t
+            
             if self.distiller == "cwd":
-                s = self.align_module[idx](s)
-                s = self.norm[idx](s)
+                aligned_s = self.align_module[idx](s)
+                normalized_s = self.norm[idx](aligned_s)
+                stu_feats.append(normalized_s)
+                tea_feats.append(t.detach())
             else:
-                t = self.norm1[idx](t)
-            tea_feats.append(t)
-            stu_feats.append(s)
+                normalized_t = self.norm1[idx](t)
+                stu_feats.append(s)
+                tea_feats.append(normalized_t.detach())
 
         loss = self.feature_loss(stu_feats, tea_feats)
         return self.loss_weight * loss
@@ -202,108 +206,110 @@ class DistillationLoss:
     def __init__(self, models, modelt, distiller="CWDLoss"):
         self.distiller = distiller
         self.layers = ["6", "8", "13", "16", "19", "22"]
-        
-        channels_s = []
-        channels_t = []
-        
-        # Find channel size
-        for name, ml in modelt.named_modules():
-            if name is not None:
-                name = name.split(".")
-                if name[0] == "model":
-                    name.pop(0)
-                if len(name) == 3:
-                    if name[1] in self.layers:
-                        if "cv2" in name[2]:
-                            channels_t.append(ml.conv.out_channels)
-        
-        for name, ml in models.named_modules():
-            if name is not None:
-                name = name.split(".")
-                if name[0] == "model":
-                    name.pop(0)
-                if len(name) == 3:
-                    if name[1] in self.layers:
-                        if "cv2" in name[2]:
-                            channels_s.append(ml.conv.out_channels)
+        self.models = models 
+        self.modelt = modelt
 
-        nl = len(self.layers)
-        channels_s = channels_s[-nl:]
-        channels_t = channels_t[-nl:]
+        # ini warm up
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 640, 640)
+            _ = self.models(dummy_input)
+            _ = self.modelt(dummy_input)
         
-        self.distill_loss_fn = FeatureLoss(channels_s=channels_s, channels_t=channels_t, distiller=distiller[:3])
-        
+        self.channels_s = []
+        self.channels_t = []
         self.teacher_module_pairs = []
         self.student_module_pairs = []
         self.remove_handle = []
+        
+        self._find_layers()
+        
+        self.distill_loss_fn = FeatureLoss(
+            channels_s=self.channels_s, 
+            channels_t=self.channels_t, 
+            distiller=distiller[:3]
+        )
+        
+    def _find_layers(self):
 
-        for mname, ml in modelt.named_modules():
-            if mname is not None:
-                name = mname.split(".")
+        self.channels_s = []
+        self.channels_t = []
+        self.teacher_module_pairs = []
+        self.student_module_pairs = []
+        
+        for name, ml in self.modelt.named_modules():
+            if name is not None:
+                name = name.split(".")
                 if name[0] == "model":
                     name.pop(0)
                 if len(name) == 3:
                     if name[1] in self.layers:
-                        if "cv2" in mname:
-                            self.teacher_module_pairs.append(ml)
-
-
-        for mname, ml in models.named_modules():
-            if mname is not None:
-                name = mname.split(".")
+                        if "cv2" in name[2]:
+                            if hasattr(ml, 'conv'):
+                                self.channels_t.append(ml.conv.out_channels)
+                                self.teacher_module_pairs.append(ml)
+        
+        for name, ml in self.models.named_modules():
+            if name is not None:
+                name = name.split(".")
                 if name[0] == "model":
                     name.pop(0)
                 if len(name) == 3:
                     if name[1] in self.layers:
-                        if "cv2" in mname:
-                            self.student_module_pairs.append(ml)
+                        if "cv2" in name[2]:
+                            if hasattr(ml, 'conv'):
+                                self.channels_s.append(ml.conv.out_channels)
+                                self.student_module_pairs.append(ml)
 
+        nl = min(len(self.channels_s), len(self.channels_t))
+        self.channels_s = self.channels_s[-nl:]
+        self.channels_t = self.channels_t[-nl:]
+        self.teacher_module_pairs = self.teacher_module_pairs[-nl:]
+        self.student_module_pairs = self.student_module_pairs[-nl:]
 
     def register_hook(self):
+        # Remove the existing hook if they exist
+        self.remove_handle_()
+        
         self.teacher_outputs = []
         self.student_outputs = []
 
-        def make_layer_forward_hook(l):
+        def make_student_hook(l):
             def forward_hook(m, input, output):
                 if isinstance(output, torch.Tensor):
-                    l.append(output.detach().clone())
+                    out = output.clone()  # Clone to ensure we don't modify the original
+                    l.append(out)
                 else:
-                    # Handle case where output might be a tuple/list
+                    l.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        def make_teacher_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    l.append(output.detach().clone())  # Detach and clone teacher outputs
+                else:
                     l.append([o.detach().clone() if isinstance(o, torch.Tensor) else o for o in output])
             return forward_hook
-        
-        # don't forget to remove previous hooks if they exist
-        self.remove_handle_()
 
         for ml, ori in zip(self.teacher_module_pairs, self.student_module_pairs):
-            self.remove_handle.append(ml.register_forward_hook(make_layer_forward_hook(self.teacher_outputs)))
-            self.remove_handle.append(ori.register_forward_hook(make_layer_forward_hook(self.origin_outputs)))
+            self.remove_handle.append(ml.register_forward_hook(make_teacher_hook(self.teacher_outputs)))
+            self.remove_handle.append(ori.register_forward_hook(make_student_hook(self.student_outputs)))
 
     def get_loss(self):
         if not self.teacher_outputs or not self.student_outputs:
             return torch.tensor(0.0, requires_grad=True)
         
-        # Create new tensors that require gradients for student outputs
-        student_outputs = []
-        for output in self.student_outputs:
-            if isinstance(output, torch.Tensor):
-                student_outputs.append(output.clone())
-            else:
-                student_outputs.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
-
-        # Create new tensors for teacher outputs (no gradients required)
-        teacher_outputs = []
-        for output in self.teacher_outputs:
-            if isinstance(output, torch.Tensor):
-                teacher_outputs.append(output.clone().detach())
-            else:
-                teacher_outputs.append([o.clone().detach() if isinstance(o, torch.Tensor) else o for o in output])
-
-        quant_loss += self.distill_loss_fn(y_t= self.teacher_outputs, y_s=self.origin_outputs)
+        if len(self.teacher_outputs) != len(self.student_outputs):
+            print(f"Warning: Mismatched outputs - Teacher: {len(self.teacher_outputs)}, Student: {len(self.student_outputs)}")
+            return torch.tensor(0.0, requires_grad=True)
+        
+        quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
+        
         if self.distiller != 'cwd':
             quant_loss *= 0.3
+
         self.teacher_outputs.clear()
         self.student_outputs.clear()
+        
         return quant_loss
 
     def remove_handle_(self):
