@@ -9,7 +9,7 @@ torch>=1.8.0
 torchvision>=0.9.0
 tqdm>=4.64.0
 psutil
-py-cpuinf
+py-cpuinfo
 pandas>=1.1.4
 seaborn>=0.11.0
 ultralytics-thop>=2.0.0

@@ -197,13 +197,12 @@ class FeatureLoss(nn.Module):
         loss = self.feature_loss(stu_feats, tea_feats)
         return self.loss_weight * loss
 
+
 class DistillationLoss:
     def __init__(self, models, modelt, distiller="CWDLoss"):
-
         self.distiller = distiller
-
-        layers = ["6", "8", "13", "16", "19", "22"]
-
+        self.layers = ["6", "8", "13", "16", "19", "22"]
+        
         channels_s = []
         channels_t = []
         
@@ -214,7 +213,7 @@ class DistillationLoss:
                 if name[0] == "model":
                     name.pop(0)
                 if len(name) == 3:
-                    if name[1] in layers:
+                    if name[1] in self.layers:
                         if "cv2" in name[2]:
                             channels_t.append(ml.conv.out_channels)
         
@@ -224,16 +223,16 @@ class DistillationLoss:
                 if name[0] == "model":
                     name.pop(0)
                 if len(name) == 3:
-                    if name[1] in layers:
+                    if name[1] in self.layers:
                         if "cv2" in name[2]:
                             channels_s.append(ml.conv.out_channels)
 
-        nl = len(layers)
+        nl = len(self.layers)
         channels_s = channels_s[-nl:]
         channels_t = channels_t[-nl:]
         
-        self.D_loss_fn = FeatureLoss(channels_s=channels_s, channels_t=channels_t, distiller=distiller[:3])
-
+        self.distill_loss_fn = FeatureLoss(channels_s=channels_s, channels_t=channels_t, distiller=distiller[:3])
+        
         self.teacher_module_pairs = []
         self.student_module_pairs = []
         self.remove_handle = []
@@ -244,7 +243,7 @@ class DistillationLoss:
                 if name[0] == "model":
                     name.pop(0)
                 if len(name) == 3:
-                    if name[1] in layers:
+                    if name[1] in self.layers:
                         if "cv2" in mname:
                             self.teacher_module_pairs.append(ml)
 
@@ -255,42 +254,62 @@ class DistillationLoss:
                 if name[0] == "model":
                     name.pop(0)
                 if len(name) == 3:
-                    if name[1] in layers:
+                    if name[1] in self.layers:
                         if "cv2" in mname:
                             self.student_module_pairs.append(ml)
 
 
     def register_hook(self):
         self.teacher_outputs = []
-        self.origin_outputs = []
-        self.teacher_outputs_clss=[]
+        self.student_outputs = []
+
         def make_layer_forward_hook(l):
             def forward_hook(m, input, output):
-                l.append(output)
-
+                if isinstance(output, torch.Tensor):
+                    l.append(output.detach().clone())
+                else:
+                    # Handle case where output might be a tuple/list
+                    l.append([o.detach().clone() if isinstance(o, torch.Tensor) else o for o in output])
             return forward_hook
+        
+        # don't forget to remove previous hooks if they exist
+        self.remove_handle_()
 
         for ml, ori in zip(self.teacher_module_pairs, self.student_module_pairs):
             self.remove_handle.append(ml.register_forward_hook(make_layer_forward_hook(self.teacher_outputs)))
             self.remove_handle.append(ori.register_forward_hook(make_layer_forward_hook(self.origin_outputs)))
 
     def get_loss(self):
-        quant_loss = 0
-        # if self.teacher_outputs[0] is None:
-        #     self.teacher_outputs_clss=self.teacher_outputs[len(self.teacher_outputs) // 2:]
-        # else :
-        #     self.teacher_outputs_clss=self.teacher_outputs
+        if not self.teacher_outputs or not self.student_outputs:
+            return torch.tensor(0.0, requires_grad=True)
+        
+        # Create new tensors that require gradients for student outputs
+        student_outputs = []
+        for output in self.student_outputs:
+            if isinstance(output, torch.Tensor):
+                student_outputs.append(output.clone())
+            else:
+                student_outputs.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
 
-        quant_loss += self.D_loss_fn(y_t= self.teacher_outputs, y_s=self.origin_outputs)
+        # Create new tensors for teacher outputs (no gradients required)
+        teacher_outputs = []
+        for output in self.teacher_outputs:
+            if isinstance(output, torch.Tensor):
+                teacher_outputs.append(output.clone().detach())
+            else:
+                teacher_outputs.append([o.clone().detach() if isinstance(o, torch.Tensor) else o for o in output])
+
+        quant_loss += self.distill_loss_fn(y_t= self.teacher_outputs, y_s=self.origin_outputs)
         if self.distiller != 'cwd':
             quant_loss *= 0.3
         self.teacher_outputs.clear()
-        self.origin_outputs.clear()
+        self.student_outputs.clear()
         return quant_loss
 
     def remove_handle_(self):
         for rm in self.remove_handle:
             rm.remove()
+        self.remove_handle.clear()
 
 class BaseTrainer:
     """
@@ -486,9 +505,9 @@ class BaseTrainer:
         
         # Load teacher model to device
         if self.teacher is not None:
-            for k, v in self.teacher.model.named_parameters():
+            for k, v in self.teacher.named_parameters():
                 v.requires_grad = True
-            self.teacher = self.teacher.model.to(self.device)
+            self.teacher = self.teacher.to(self.device)
                 
         self.set_model_attributes()
 
