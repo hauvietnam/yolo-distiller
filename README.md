@@ -37,6 +37,11 @@ student_model.train(
 ```
 
 ## Credits
+
+- Channel-Wise Distillation Loss Implementation: [https://github.com/pppppM/mmdetection-distiller](https://github.com/pppppM/mmdetection-distiller)
+- Mask Generation Distillation Loss Implementation: [https://github.com/yzd-v/MGD](https://github.com/yzd-v/MGD)
+- YOLOv5 Knowledge Distillation Implementation: [https://github.com/wonbeomjang/yolov5-knowledge-distillation](https://github.com/wonbeomjang/yolov5-knowledge-distillation)
+
 ```
 @software{Jocher_Ultralytics_YOLO_2023,
   author = {Jocher, Glenn and Qiu, Jing and Chaurasia, Ayush},
