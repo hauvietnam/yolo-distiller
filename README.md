@@ -1,4 +1,4 @@
-# YOLOv11 with Knowledge Distillation
+# Ultralytics YOLO with Additional Knowledge Distillation Capability
 
 <div align="center">
   <p>
