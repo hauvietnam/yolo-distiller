@@ -8,6 +8,9 @@
   </p>
 </div>
 
+## Core Idea
+
+![image](https://github.com/user-attachments/assets/2acfbc67-7cf0-4591-ba27-cdf4370b88e2)
 
 
 ## How to Run
