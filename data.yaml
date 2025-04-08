@@ -1,0 +1,12 @@
+nc: 1
+names: ["damaged"]
+train:
+ - /kaggle/input/road-damage-dataset/road-datasets/70_percent/images
+ - /kaggle/input/road-damage-dataset/road-datasets/dashcam_view/train/images
+ - /kaggle/input/road-damage-dataset/road-datasets/dashcam_view/valid/images
+ - /kaggle/input/road-damage-dataset/road-datasets/dashcam_view/test/images
+ - /kaggle/input/road-damage-dataset/road-datasets/valid/images
+val:
+ - /kaggle/input/road-damage-dataset/road-datasets/20_percent/images
+ - /kaggle/input/road-damage-dataset/road-datasets/10_percent/images
+ - /kaggle/input/road-damage-dataset/road-datasets/new_road/images
